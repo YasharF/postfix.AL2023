@@ -1,0 +1,402 @@
+name: Publish
+# Adds a Build run's RPMs to the dnf repositories on gh-pages and rebuilds
+# their metadata.
+#
+# One repository per Postfix release series, at al2023/<series>/<arch>/. Each
+# RPM is routed by the version in its filename, so a new series needs no change
+# here.
+#
+# Nothing is ever removed, so older builds stay installable.
+#
+# Publish a build:
+#   gh workflow run Publish -f run_id=<Build run id>
+
+on:
+  workflow_run:
+    workflows: [Verify]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: 'Build run ID whose RPMs to publish'
+        required: true
+
+permissions:
+  actions: read
+  contents: read
+
+# Two publishes must not interleave on gh-pages.
+concurrency: publish
+
+jobs:
+  # No marker from Verify means there was nothing to verify.
+  resolve:
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-24.04
+    outputs:
+      run_id: ${{ steps.resolve.outputs.run_id }}
+      proceed: ${{ steps.resolve.outputs.proceed }}
+    steps:
+      - if: github.event_name == 'workflow_run'
+        id: download
+        continue-on-error: true
+        uses: actions/download-artifact@v8
+        with:
+          name: verified-build
+          path: verified-build
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ github.token }}
+
+      - id: resolve
+        run: |
+          if [ "${{ github.event_name }}" = 'workflow_dispatch' ]; then
+            echo "run_id=${{ inputs.run_id }}" >> "$GITHUB_OUTPUT"
+            echo "proceed=true" >> "$GITHUB_OUTPUT"
+          elif [ "${{ steps.download.outcome }}" = 'success' ]; then
+            . verified-build/verified-build.env
+            echo "run_id=$run_id" >> "$GITHUB_OUTPUT"
+            echo "proceed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Verify did not leave a verified build to publish"
+            echo "proceed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  publish:
+    needs: resolve
+    if: needs.resolve.outputs.proceed == 'true'
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: read
+      contents: write
+    outputs:
+      published: ${{ steps.push.outputs.published }}
+      prev_sha: ${{ steps.push.outputs.prev_sha }}
+      matrix: ${{ steps.add.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          path: src
+
+      # gh-pages is a store, not a build output: start from what is there.
+      - name: Check out the published repository
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          url="https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          if git ls-remote --exit-code --heads "$url" gh-pages >/dev/null; then
+            git clone -q --branch gh-pages --single-branch "$url" site
+          else
+            mkdir site
+            git -C site init -q -b gh-pages
+            git -C site remote add origin "$url"
+          fi
+
+      # A run can carry several releases. Flattening them is fine: each RPM is
+      # routed by its own filename below.
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: rpms-*-x86_64
+          path: incoming/x86_64
+          merge-multiple: true
+          run-id: ${{ needs.resolve.outputs.run_id }}
+          github-token: ${{ github.token }}
+
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: rpms-*-aarch64
+          path: incoming/aarch64
+          merge-multiple: true
+          run-id: ${{ needs.resolve.outputs.run_id }}
+          github-token: ${{ github.token }}
+
+      # Signed before anything is copied, so nothing unsigned can reach
+      # gh-pages. A missing key fails the run: publishing unsigned packages
+      # into a gpgcheck=1 repository would produce one nobody can install from.
+      - name: Sign the RPMs
+        env:
+          RPM_GPG_PRIVATE_KEY: ${{ secrets.RPM_GPG_PRIVATE_KEY }}
+          RPM_GPG_PASSPHRASE: ${{ secrets.RPM_GPG_PASSPHRASE }}
+        run: |
+          set -euo pipefail
+          [ -n "$RPM_GPG_PRIVATE_KEY" ] || {
+            echo "RPM_GPG_PRIVATE_KEY is not set; this repository cannot publish unsigned"
+            exit 1
+          }
+          # -e without a value: the secret comes from the environment rather
+          # than the command line, where it would show up in ps.
+          docker run --rm -v "$PWD:/w" -w /w \
+            -e RPM_GPG_PRIVATE_KEY -e RPM_GPG_PASSPHRASE \
+            public.ecr.aws/amazonlinux/amazonlinux:2023 \
+            ./src/build/sign.sh rpms incoming
+          sudo chown -R "$(id -u):$(id -g)" incoming
+
+      # Never replace a published file. Rebuilding a release produces the same
+      # filename, and hosts may already have that copy.
+      - name: Add the new RPMs
+        id: add
+        run: |
+          set -euo pipefail
+          new=0
+          touched=''
+          : > versions.txt
+          for arch in x86_64 aarch64; do
+            for f in "incoming/$arch"/*.rpm; do
+              base=$(basename "$f")
+              # postfix-3.11.6-1.amzn2023.x86_64.rpm -> series 3.11.
+              # Subpackages and noarch match the same way.
+              if [[ $base =~ -([0-9]+\.[0-9]+)\.[0-9]+-[^-]+\.(x86_64|aarch64|noarch)\.rpm$ ]]; then
+                series=${BASH_REMATCH[1]}
+              else
+                echo "cannot tell which Postfix series $base belongs to"
+                exit 1
+              fi
+              mkdir -p "site/al2023/$series/$arch"
+              dest="site/al2023/$series/$arch/$base"
+              if [ -e "$dest" ]; then
+                echo "already published: $base"
+              else
+                cp "$f" "$dest"
+                new=$((new + 1))
+                # The base package names the release; the post-upload check
+                # needs it to tell fresh metadata from stale.
+                if [[ $base =~ ^postfix-([0-9]+\.[0-9]+\.[0-9]+-[^-]+)\.(x86_64|aarch64)\.rpm$ ]]; then
+                  echo "$series/$arch ${BASH_REMATCH[1]}" >> versions.txt
+                fi
+                case " $touched " in
+                  *" $series/$arch "*) ;;
+                  *) touched="$touched $series/$arch" ;;
+                esac
+              fi
+            done
+          done
+
+          # Consumers import this to check both the packages and the metadata.
+          cp src/RPM-GPG-KEY-yasharf-al2023 site/RPM-GPG-KEY-yasharf-al2023
+
+          # One .repo per published series, from the template.
+          for d in site/al2023/*/; do
+            series=$(basename "$d")
+            sed "s/@SERIES@/$series/g" src/postfix-al2023.repo.in \
+              > "site/postfix-al2023-$series.repo"
+            echo "wrote postfix-al2023-$series.repo"
+          done
+
+          # Stops Pages running Jekyll over the package tree.
+          touch site/.nojekyll
+          # The series/arch pairs to re-check once this is live.
+          matrix=$(for t in $touched; do
+              a=${t##*/}
+              case $a in
+                x86_64)  r=ubuntu-24.04 ;;
+                aarch64) r=ubuntu-24.04-arm ;;
+                *) echo "no runner for $a" >&2; exit 1 ;;
+              esac
+              v=$(awk -v k="$t" '$1 == k {print $2}' versions.txt | sort -V | tail -1)
+              jq -c -n --arg series "${t%%/*}" --arg arch "$a" --arg runner "$r" --arg version "$v" \
+                '{series: $series, arch: $arch, runner: $runner, version: $version}'
+            done | jq -s -c .)
+
+          echo "added $new package(s)"
+          echo "new=$new" >> "$GITHUB_OUTPUT"
+          echo "touched=$touched" >> "$GITHUB_OUTPUT"
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+
+      # createrepo_c from AL2023 itself. --update reuses existing metadata.
+      # Skipped when nothing was added: its output is timestamped, so a no-op
+      # run would still commit churn.
+      - name: Rebuild the repository metadata
+        if: steps.add.outputs.new != '0'
+        env:
+          TOUCHED: ${{ steps.add.outputs.touched }}
+        run: |
+          # Only the trees that gained a package.
+          docker run --rm -v "$PWD/site:/site" -w /site -e TOUCHED \
+            public.ecr.aws/amazonlinux/amazonlinux:2023 \
+            bash -c 'dnf -y -q install createrepo_c &&
+              for t in $TOUCHED; do createrepo_c --update "al2023/$t"; done'
+          # The container wrote as root; git runs as the runner user.
+          sudo chown -R "$(id -u):$(id -g)" site
+
+      # repomd.xml is what repo_gpgcheck verifies, and createrepo_c has just
+      # rewritten it for each touched tree. Untouched trees keep a metadata
+      # file that their existing signature still covers.
+      - name: Sign the repository metadata
+        if: steps.add.outputs.new != '0'
+        env:
+          RPM_GPG_PRIVATE_KEY: ${{ secrets.RPM_GPG_PRIVATE_KEY }}
+          RPM_GPG_PASSPHRASE: ${{ secrets.RPM_GPG_PASSPHRASE }}
+          TOUCHED: ${{ steps.add.outputs.touched }}
+        run: |
+          set -euo pipefail
+          files=''
+          for t in $TOUCHED; do
+            files="$files site/al2023/$t/repodata/repomd.xml"
+          done
+          # $files is split on purpose: one argument per tree.
+          docker run --rm -v "$PWD:/w" -w /w \
+            -e RPM_GPG_PRIVATE_KEY -e RPM_GPG_PASSPHRASE \
+            public.ecr.aws/amazonlinux/amazonlinux:2023 \
+            ./src/build/sign.sh repomd $files
+          sudo chown -R "$(id -u):$(id -g)" site
+
+      # site/ is byte for byte what Pages will serve, so install from it here,
+      # over HTTP, exactly as a consumer would. A failure means nothing is
+      # uploaded at all and consumers carry on with the previous release.
+      #
+      # Only the runner's own architecture can be installed, so this covers
+      # x86_64; the post-upload check covers both.
+      - name: Install from the assembled repository before uploading
+        if: steps.add.outputs.new != '0'
+        env:
+          TOUCHED: ${{ steps.add.outputs.touched }}
+        run: |
+          set -euo pipefail
+          python3 -m http.server 8000 --directory site >/dev/null 2>&1 &
+          server=$!
+          trap 'kill $server 2>/dev/null || true' EXIT
+          for _ in $(seq 1 20); do
+            curl -fsS -o /dev/null http://127.0.0.1:8000/ && break
+            sleep 1
+          done
+          for s in $(for t in $TOUCHED; do echo "${t%%/*}"; done | sort -u); do
+            {
+              echo "[postfix-al2023-$s]"
+              echo "name=Postfix $s.x pre-upload check"
+              echo "baseurl=http://127.0.0.1:8000/al2023/$s/\$basearch/"
+              echo "enabled=1"
+              echo "gpgcheck=1"
+              echo "repo_gpgcheck=1"
+              echo "gpgkey=http://127.0.0.1:8000/RPM-GPG-KEY-yasharf-al2023"
+              echo "priority=5"
+            } > "check-$s.repo"
+            docker run --rm --network host -v "$PWD:/w" -w /w \
+              public.ecr.aws/amazonlinux/amazonlinux:2023 \
+              bash -euc "cp /w/check-$s.repo /etc/yum.repos.d/postfix-al2023-$s.repo &&
+                         /w/src/verify/repo-install.sh $s"
+          done
+
+      - name: Publish
+        id: push
+        run: |
+          set -euo pipefail
+          cd site
+          # Where to reset back to if the live repository turns out bad. Empty
+          # when gh-pages did not exist yet, in which case rollback deletes it.
+          prev=$(git rev-parse HEAD 2>/dev/null || true)
+          git add -A
+          git -c user.name='github-actions[bot]' \
+              -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
+              commit -q -m "Publish RPMs from build ${{ needs.resolve.outputs.run_id }}" \
+            || { echo "nothing new to publish"; echo "published=false" >> "$GITHUB_OUTPUT"; exit 0; }
+          git push -q origin gh-pages
+          echo "published=true" >> "$GITHUB_OUTPUT"
+          echo "prev_sha=$prev" >> "$GITHUB_OUTPUT"
+
+  # The same install as the pre-upload gate, but against the real address, so
+  # it also covers whether Pages accepted and is serving the upload.
+  smoke:
+    needs: publish
+    if: needs.publish.outputs.published == 'true' && needs.publish.outputs.matrix != '[]'
+    strategy:
+      fail-fast: false
+      matrix:
+        job: ${{ fromJSON(needs.publish.outputs.matrix) }}
+    runs-on: ${{ matrix.job.runner }}
+    steps:
+      - uses: actions/checkout@v7
+
+      # Pages takes a while to deploy. Without this the check reads stale
+      # metadata, or a 404 that fixes itself a minute later.
+      # Waiting for repomd.xml to merely exist is not enough: the old one is
+      # still there and still valid, and a check that runs against it passes
+      # without ever seeing the release it was meant to test.
+      - name: Wait for Pages to serve the new release
+        env:
+          BASE: https://yasharf.github.io/postfix.AL2023/al2023/${{ matrix.job.series }}/${{ matrix.job.arch }}
+          VERSION: ${{ matrix.job.version }}
+        run: |
+          set -euo pipefail
+          for _ in $(seq 1 60); do
+            if curl -fsS -o /tmp/repomd.xml "$BASE/repodata/repomd.xml"; then
+              href=$(sed -n 's|.*href="\(repodata/[^"]*primary\.xml\.gz\)".*|\1|p' /tmp/repomd.xml | head -1)
+              # Unpacked to a file rather than piped into grep: grep -q exits
+              # on the first match, which leaves gzip writing into a closed
+              # pipe, and pipefail then reports the match as a failure.
+              if [ -n "$href" ] &&
+                 curl -fsS -o /tmp/primary.xml.gz "$BASE/$href" &&
+                 gzip -dcf /tmp/primary.xml.gz > /tmp/primary.xml &&
+                 grep -q "$VERSION" /tmp/primary.xml; then
+                echo "the site is serving $VERSION"
+                exit 0
+              fi
+            fi
+            sleep 15
+          done
+          echo "the site never served $VERSION for series ${{ matrix.job.series }} on ${{ matrix.job.arch }}"
+          exit 1
+
+      # Retried, because a failure here rolls the release back. A slow deploy
+      # or a momentary error must not be mistaken for a broken package.
+      - name: A consumer can install Postfix from it
+        env:
+          SERIES: ${{ matrix.job.series }}
+          VERSION: ${{ matrix.job.version }}
+        run: |
+          set -euo pipefail
+          for attempt in 1 2 3; do
+            if docker run --rm -v "$PWD:/w" -w /w -e SERIES -e VERSION \
+                 public.ecr.aws/amazonlinux/amazonlinux:2023 \
+                 bash -euc 'curl -fsSLo "/etc/yum.repos.d/postfix-al2023-$SERIES.repo" \
+                              "https://yasharf.github.io/postfix.AL2023/postfix-al2023-$SERIES.repo" &&
+                            /w/verify/repo-install.sh "$SERIES" "$VERSION"'; then
+              exit 0
+            fi
+            echo "attempt $attempt failed"
+            sleep 60
+          done
+          echo "the published repository is not installable after 3 attempts"
+          exit 1
+
+  # Withdraw the release if the live repository is bad. Reset rather than
+  # revert: a release that fails this way every day would otherwise add its
+  # packages to the branch history on every retry.
+  rollback:
+    needs: [publish, smoke]
+    if: always() && needs.publish.outputs.published == 'true' && needs.smoke.result == 'failure'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Roll gh-pages back
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PREV: ${{ needs.publish.outputs.prev_sha }}
+        run: |
+          set -euo pipefail
+          # No recorded rollback point means the publish job did not find an
+          # existing gh-pages. Something is wrong that a rollback cannot fix,
+          # so stop and leave the branch alone.
+          if [ -z "$PREV" ]; then
+            echo "no rollback point was recorded for this publish"
+            echo "refusing to touch gh-pages; look at it by hand"
+            exit 1
+          fi
+          url="https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git clone -q --branch gh-pages --single-branch "$url" site
+          cd site
+          git cat-file -e "$PREV^{commit}" 2>/dev/null || {
+            echo "$PREV is not a commit on gh-pages; refusing to reset to it"
+            exit 1
+          }
+          echo "resetting gh-pages from $(git rev-parse HEAD) back to $PREV"
+          git reset -q --hard "$PREV"
+          # A force push is irreversible, so refuse one that would leave the
+          # repository with nothing in it.
+          n=$(find al2023 -name '*.rpm' 2>/dev/null | wc -l)
+          [ "$n" -gt 0 ] || {
+            echo "the rollback target holds no packages; refusing to push"
+            exit 1
+          }
+          echo "rolling back to a tree holding $n package(s)"
+          git push -q --force "$url" gh-pages
+          echo "rolled back; the next Watch run will build this release again"

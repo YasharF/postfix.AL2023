@@ -1,0 +1,23 @@
+# Settings the verify harness applies through postconf -e. Comments and blank
+# lines are stripped before they are passed; everything else must be a single
+# name = value pair.
+myhostname = postfix-verify.example.com
+mydomain = example.com
+myorigin = $mydomain
+inet_interfaces = 127.0.0.1
+inet_protocols = ipv4
+mydestination = $myhostname, localhost.$mydomain, localhost, $mydomain
+mynetworks = 127.0.0.0/8
+
+# Deliver locally to a Maildir under /var/mail so a delivered message is a
+# file the checks can look for, rather than something to parse out of mbox.
+home_mailbox = Maildir/
+
+# STARTTLS, using the self-signed cert the postfix %post scriptlet generates.
+smtpd_tls_cert_file = /etc/pki/tls/certs/postfix.pem
+smtpd_tls_key_file = /etc/pki/tls/private/postfix.key
+smtpd_tls_security_level = may
+smtpd_tls_loglevel = 1
+
+# Log to a file rather than syslog: nothing is running syslog in the container.
+maillog_file = /var/log/maillog

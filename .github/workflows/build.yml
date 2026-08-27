@@ -1,0 +1,95 @@
+name: Build
+# Builds Postfix RPMs for AL2023, on both architectures.
+#
+# Watch can hand over several releases at once, so the matrix covers every
+# release and architecture pair.
+
+on:
+  workflow_run:
+    workflows: [Watch]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Postfix version, e.g. 3.11.6 -- must match what the spec branch currently carries'
+        required: true
+      release:
+        description: 'Fedora spec release, e.g. 1'
+        required: true
+        default: '1'
+      branch:
+        description: 'Fedora dist-git branch carrying it, e.g. rawhide or f45'
+        required: true
+        default: 'rawhide'
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  # A manual run names one release. A run from Watch carries only its run id,
+  # so the list comes from Watch's artifact. No artifact means nothing to do.
+  resolve:
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-24.04
+    outputs:
+      candidates: ${{ steps.resolve.outputs.candidates }}
+      proceed: ${{ steps.resolve.outputs.proceed }}
+    steps:
+      - if: github.event_name == 'workflow_run'
+        id: download
+        continue-on-error: true
+        uses: actions/download-artifact@v8
+        with:
+          name: new-release
+          path: new-release
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ github.token }}
+
+      - id: resolve
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = 'workflow_dispatch' ]; then
+            v='${{ inputs.version }}'
+            candidates=$(jq -c -n \
+              --arg version "$v" \
+              --arg release '${{ inputs.release }}' \
+              --arg branch '${{ inputs.branch }}' \
+              --arg series "$(printf '%s' "$v" | cut -d. -f1,2)" \
+              '[ {version: $version, release: $release, branch: $branch, series: $series} as $c
+                 | ({x86_64: "ubuntu-24.04", aarch64: "ubuntu-24.04-arm"} | to_entries[])
+                 | $c + {arch: .key, runner: .value} ]')
+            echo "candidates=$candidates" >> "$GITHUB_OUTPUT"
+            echo "proceed=true" >> "$GITHUB_OUTPUT"
+          elif [ "${{ steps.download.outcome }}" = 'success' ]; then
+            candidates=$(jq -c . new-release/candidates.json)
+            echo "candidates=$candidates" >> "$GITHUB_OUTPUT"
+            echo "proceed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Watch did not leave a new release to build"
+            echo "proceed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    needs: resolve
+    if: needs.resolve.outputs.proceed == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        job: ${{ fromJSON(needs.resolve.outputs.candidates) }}
+    runs-on: ${{ matrix.job.runner }}
+    steps:
+      - uses: actions/checkout@v7
+      - run: |
+          docker run --rm -v "$PWD:/w" -w /w \
+            public.ecr.aws/amazonlinux/amazonlinux:2023 \
+            ./build/build.sh \
+              '${{ matrix.job.version }}' \
+              '${{ matrix.job.release }}' \
+              '${{ matrix.job.branch }}'
+
+      # Version in the name so several releases in one run don't collide.
+      - uses: actions/upload-artifact@v7
+        with:
+          name: rpms-${{ matrix.job.version }}-${{ matrix.job.release }}-${{ matrix.job.arch }}
+          path: out/RPMS/

@@ -1,0 +1,10 @@
+# Build output: RPMs and build logs.
+/out/
+
+# Other potential dev artifacts
+/assets/
+__pycache__/
+*.pyc
+
+# Secret files
+secret.asc

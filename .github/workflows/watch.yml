@@ -1,0 +1,152 @@
+name: Watch
+# Finds Postfix releases not yet published here and hands them to Build.
+#
+# The version list comes from a Postfix release mirror, which carries every
+# release. The RPM spec comes from Fedora, from the branch matching each
+# release's version series.
+
+on:
+  schedule:
+    - cron: '17 5 * * *'
+  workflow_dispatch:
+
+permissions:
+  actions: read
+  contents: read
+
+env:
+  # Oldest Postfix version to build. Anything below this is ignored.
+  # Raise it to stop publishing an older series.
+  MIN_VERSION: '3.11.6'
+
+jobs:
+  watch:
+    runs-on: ubuntu-24.04
+    outputs:
+      candidates: ${{ steps.scan.outputs.candidates }}
+      found: ${{ steps.scan.outputs.found }}
+    steps:
+      # A manual run during a build would start a second build of the same
+      # release.
+      - name: Skip if a Build is already running
+        id: inflight
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          n=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow=build.yml \
+                --status=in_progress --json databaseId --jq 'length')
+          q=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow=build.yml \
+                --status=queued --json databaseId --jq 'length')
+          if [ "$((n + q))" -gt 0 ]; then
+            echo "a Build is already in flight; nothing to do"
+            echo "busy=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "busy=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Find unpublished releases
+        id: scan
+        if: steps.inflight.outputs.busy == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MIRRORS: ${{ vars.POSTFIX_MIRRORS || 'http://ftp.netclusive.de/pub/postfix/postfix-release' }}
+        run: |
+          set -euo pipefail
+
+          api=https://src.fedoraproject.org/api/0/rpms/postfix/git/branches
+          distgit=https://src.fedoraproject.org/rpms/postfix/raw
+
+          get() { curl -fsSL --retry 5 --retry-delay 5 --retry-all-errors "$@"; }
+
+          # sort -V so 3.9.11 sorts below 3.11.6.
+          at_least() {
+            [ "$(printf '%s\n%s\n' "$MIN_VERSION" "$1" | sort -V | head -1)" = "$MIN_VERSION" ]
+          }
+          # 3.11.6 -> 3.11
+          series() { printf '%s\n' "$1" | cut -d. -f1,2; }
+
+          releases=''
+          for m in $MIRRORS; do
+            listing=$(get "$m/official/" 2>/dev/null) || { echo "$m: no listing"; continue; }
+            releases=$(printf '%s\n' "$listing" \
+              | grep -oE 'postfix-[0-9]+\.[0-9]+\.[0-9]+\.tar\.gz' \
+              | sed -e 's/^postfix-//' -e 's/\.tar\.gz$//' | sort -V -u)
+            [ -n "$releases" ] && { echo "release list from $m"; break; }
+          done
+          [ -n "$releases" ] || { echo "no mirror served a release listing"; exit 1; }
+
+          wanted=$(for v in $releases; do at_least "$v" && echo "$v"; done)
+          echo "at or above $MIN_VERSION:" $wanted
+
+          # Map each version series to the newest Fedora branch carrying it.
+          branches=$(get "$api" | jq -r '.branches[]' \
+                       | grep -E '^f[0-9]+$' | sed 's/^f//' | sort -rn | sed 's/^/f/')
+          declare -A spec_branch spec_version
+          for b in rawhide $branches; do
+            spec=$(get "$distgit/$b/f/postfix.spec" 2>/dev/null) || continue
+            bv=$(printf '%s\n' "$spec" | sed -n 's/^Version:[[:space:]]*//p' | head -1)
+            br=$(printf '%s\n' "$spec" | sed -n 's/^Release:[[:space:]]*\([0-9]\{1,\}\).*/\1/p' | head -1)
+            [ -n "$bv" ] || continue
+            s=$(series "$bv")
+            echo "$b: $bv-$br ($s)"
+            if [ -z "${spec_branch[$s]:-}" ]; then
+              spec_branch[$s]=$b
+              spec_version[$s]=$bv-$br
+            fi
+            # Older branches only carry older series.
+            at_least "$bv" || break
+          done
+
+          candidates='[]'
+          for v in $wanted; do
+            s=$(series "$v")
+            b=${spec_branch[$s]:-}
+            if [ -z "$b" ]; then
+              echo "SKIP $v: no Fedora branch carries $s"
+              continue
+            fi
+            # Fedora's release number if it packaged this exact version, else 1.
+            sv=${spec_version[$s]}
+            if [ "${sv%-*}" = "$v" ]; then r=${sv##*-}; else r=1; fi
+
+            # Read gh-pages directly. The served site sits behind a CDN and lags.
+            names=$(gh api "repos/$GITHUB_REPOSITORY/contents/al2023/$s/x86_64?ref=gh-pages" \
+                      --jq '.[].name' 2>/dev/null || true)
+            # Filenames carry a dist suffix: postfix-3.11.6-1.amzn2023.x86_64.rpm
+            if printf '%s\n' "$names" | grep -qE "^postfix-$v-$r(\.[^-]+)?\.x86_64\.rpm\$"; then
+              echo "$v-$r already published under series $s"
+              continue
+            fi
+            echo "BUILD $v-$r from $b (series $s)"
+            candidates=$(printf '%s' "$candidates" | jq -c \
+              --arg version "$v" --arg release "$r" --arg branch "$b" --arg series "$s" \
+              '. + [{version: $version, release: $release, branch: $branch, series: $series}]')
+          done
+
+          # One entry per release and architecture, for Build and Verify to
+          # matrix over.
+          jobs=$(printf '%s' "$candidates" | jq -c '[ .[] as $c
+            | ({x86_64: "ubuntu-24.04", aarch64: "ubuntu-24.04-arm"} | to_entries[])
+            | $c + {arch: .key, runner: .value} ]')
+
+          n=$(printf '%s' "$candidates" | jq 'length')
+          echo "$n release(s) to build"
+          printf '%s\n' "$jobs" | jq .
+          {
+            echo "candidates=$jobs"
+            echo "found=$([ "$n" -gt 0 ] && echo true || echo false)"
+          } >> "$GITHUB_OUTPUT"
+
+      # Build triggers on this workflow completing. A GITHUB_TOKEN run cannot
+      # dispatch another workflow directly.
+      - name: Leave a marker for Build
+        if: steps.scan.outputs.found == 'true'
+        run: |
+          printf '%s\n' '${{ steps.scan.outputs.candidates }}' > candidates.json
+          cat candidates.json
+
+      - uses: actions/upload-artifact@v7
+        if: steps.scan.outputs.found == 'true'
+        with:
+          name: new-release
+          path: candidates.json

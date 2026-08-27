@@ -1,0 +1,211 @@
+name: Verify
+# Installs a Build run's RPMs on a clean AL2023 host and checks Postfix works:
+# lookup backends load, mail goes through SMTP and STARTTLS, and an AL2023 host
+# upgrades in place.
+#
+# Each release in the run is verified separately, on both architectures.
+
+on:
+  workflow_run:
+    workflows: [Build]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: 'Build run ID whose RPMs to test'
+        required: true
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  # Build can succeed having built nothing, so this looks for artifacts rather
+  # than trusting its conclusion. Their names, rpms-<version>-<release>-<arch>,
+  # are also the matrix.
+  resolve:
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-24.04
+    outputs:
+      run_id: ${{ steps.resolve.outputs.run_id }}
+      jobs: ${{ steps.resolve.outputs.jobs }}
+      proceed: ${{ steps.resolve.outputs.proceed }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - id: resolve
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = 'workflow_dispatch' ]; then
+            run_id='${{ inputs.run_id }}'
+          else
+            run_id='${{ github.event.workflow_run.id }}'
+          fi
+          echo "run_id=$run_id" >> "$GITHUB_OUTPUT"
+
+          names=$(gh api --paginate "repos/$GITHUB_REPOSITORY/actions/runs/$run_id/artifacts" \
+                    --jq '.artifacts[].name | select(startswith("rpms-"))' | sort -u)
+          jobs='[]'
+          for n in $names; do
+            rest=${n#rpms-}
+            arch=${rest##*-}
+            vr=${rest%-*}
+            release=${vr##*-}
+            version=${vr%-*}
+            case "$arch" in
+              x86_64)  runner=ubuntu-24.04 ;;
+              aarch64) runner=ubuntu-24.04-arm ;;
+              *) echo "artifact $n does not name an architecture this can verify"; exit 1 ;;
+            esac
+            jobs=$(printf '%s' "$jobs" | jq -c \
+              --arg version "$version" --arg release "$release" \
+              --arg arch "$arch" --arg runner "$runner" \
+              --arg series "$(printf '%s' "$version" | cut -d. -f1,2)" \
+              '. + [{version: $version, release: $release, arch: $arch, runner: $runner, series: $series}]')
+          done
+
+          n=$(printf '%s' "$jobs" | jq 'length')
+          if [ "$n" -gt 0 ]; then
+            printf '%s\n' "$jobs" | jq .
+            echo "jobs=$jobs" >> "$GITHUB_OUTPUT"
+            echo "proceed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Build run $run_id produced no rpms-* artifacts to verify"
+            echo "proceed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  verify:
+    needs: resolve
+    if: needs.resolve.outputs.proceed == 'true'
+    # The signal job needs the run id.
+    outputs:
+      run_id: ${{ needs.resolve.outputs.run_id }}
+    strategy:
+      fail-fast: false
+      matrix:
+        job: ${{ fromJSON(needs.resolve.outputs.jobs) }}
+    runs-on: ${{ matrix.job.runner }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: rpms-${{ matrix.job.version }}-${{ matrix.job.release }}-${{ matrix.job.arch }}
+          path: rpms
+          run-id: ${{ needs.resolve.outputs.run_id }}
+          github-token: ${{ github.token }}
+
+      # docker exec into a long-lived container, so setup output streams into
+      # the log and a failure lands on the step that caused it.
+      - name: Start a container
+        run: |
+          docker run -d --name postfix --network host -v "$PWD:/w" -w /w \
+            public.ecr.aws/amazonlinux/amazonlinux:2023 sleep infinity
+
+      - name: Install the RPMs and start Postfix
+        run: docker exec postfix ./verify/run.sh /w/rpms
+
+      - name: Postfix is listening on 127.0.0.1:25
+        run: |
+          for i in $(seq 1 30); do
+            (exec 3<>/dev/tcp/127.0.0.1/25) 2>/dev/null && exit 0
+            sleep 2
+          done
+          docker exec postfix ss -ltnp || true
+          docker exec postfix cat /var/log/maillog || true
+          echo "postfix never listened on 127.0.0.1:25"
+          exit 1
+
+      # No hardcoded version. The binary must match its own package, which
+      # holds for any release and catches a build using the wrong tarball.
+      - name: The running binary is the version its package claims
+        run: |
+          pkg=$(docker exec postfix rpm -q --qf '%{version}' postfix)
+          run=$(docker exec postfix postconf -h mail_version)
+          echo "package says $pkg, mail_version says $run"
+          [ "$pkg" = "$run" ] || { echo "the binary and its package disagree"; exit 1; }
+          docker exec postfix rpm -qa --qf '%{epoch}:%{name}-%{version}-%{release}.%{arch}\n' 'postfix*' 
+
+      - name: Postfix agrees its own configuration is sane
+        run: docker exec postfix postfix check
+
+      - name: Every map plugin loads, and the local ones round trip
+        run: docker exec postfix /w/verify/check-maps.sh
+
+      - name: Mail goes through plain SMTP and lands in the mailbox
+        run: |
+          docker exec postfix python3 /w/verify/smtp-send.py \
+            --to root@example.com --marker plain-smtp
+          docker exec postfix /w/verify/wait-for-delivery.sh /root/Maildir plain-smtp
+
+      - name: Mail goes through STARTTLS and lands in the mailbox
+        run: |
+          docker exec postfix python3 /w/verify/smtp-send.py \
+            --to root@example.com --marker starttls --starttls
+          docker exec postfix /w/verify/wait-for-delivery.sh /root/Maildir starttls
+
+      - name: The sendmail compatibility interface works
+        run: |
+          docker exec postfix sh -c \
+            'printf "Subject: postfix verify sendmail\n\nmarker: sendmail-cmd\n" | sendmail -f verify@example.com root@example.com'
+          docker exec postfix /w/verify/wait-for-delivery.sh /root/Maildir sendmail-cmd
+
+      - name: Nothing is stuck in the queue
+        run: |
+          docker exec postfix postqueue -p
+          [ "$(docker exec postfix sh -c 'postqueue -p | grep -c "^[A-F0-9]"')" = 0 ] \
+            || { echo "messages left in the queue"; exit 1; }
+
+      # The upgrade path a real host takes. Separate container so the checks
+      # above run against a clean install.
+      - name: An AL2023 host upgrades in place
+        run: |
+          docker run --rm -v "$PWD:/w" -w /w \
+            public.ecr.aws/amazonlinux/amazonlinux:2023 bash -euxc '
+              dnf -y install shadow-utils openssl hostname procps-ng systemd postfix
+              before=$(rpm -q --qf "%{version}" postfix)
+              mapfile -t pkgs < <(find /w/rpms -name "postfix-*.rpm" \
+                  ! -name "*-debuginfo-*" ! -name "*-debugsource-*" | sort)
+              dnf -y upgrade "${pkgs[@]}"
+              after=$(rpm -q --qf "%{version}" postfix)
+              echo "AL2023 shipped $before; upgraded to $after"
+              # Must move, and move forwards.
+              [ "$before" != "$after" ]
+              [ "$(printf "%s\n%s\n" "$before" "$after" | sort -V | tail -1)" = "$after" ]
+              [ "$(postconf -h mail_version)" = "$after" ]
+              # The queue tree comes from tmpfiles, which no container runs.
+              systemd-tmpfiles --create /usr/lib/tmpfiles.d/postfix.conf
+              postfix check
+            '
+
+      - name: Diagnose a failure
+        if: failure()
+        run: |
+          echo "=== processes ==="
+          docker exec postfix ps -eo pid,stat,etime,args || true
+          echo "=== mail log ==="
+          docker exec postfix cat /var/log/maillog || true
+          echo "=== listening sockets ==="
+          docker exec postfix ss -ltnp || true
+          echo "=== non-default configuration ==="
+          docker exec postfix postconf -n || true
+          echo "=== master.cf ==="
+          docker exec postfix cat /etc/postfix/master.cf || true
+
+      - name: Package list
+        if: always()
+        run: docker exec postfix rpm -qa 'postfix*' || true
+
+  # Waits for every leg: nothing is signalled unless all of them passed.
+  signal:
+    needs: verify
+    runs-on: ubuntu-24.04
+    steps:
+      - run: |
+          echo "run_id=${{ needs.verify.outputs.run_id }}" >> verified-build.env
+          cat verified-build.env
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: verified-build
+          path: verified-build.env
