@@ -1,0 +1,19 @@
+# Template. Publish substitutes the release series and writes one
+# postfix-al2023-<series>.repo per published series.
+#
+# One repository per release series -- 3.11, 3.12, 4.0 -- so a host is never
+# moved onto a new series.
+[postfix-al2023-3.11]
+name=Postfix 3.11.x for Amazon Linux 2023 (unofficial rebuild)
+baseurl=https://yasharf.github.io/postfix.AL2023/al2023/3.11/$basearch/
+enabled=1
+gpgcheck=1
+# The metadata is signed too, so a tampered package list is caught before
+# any package is fetched.
+repo_gpgcheck=1
+gpgkey=https://yasharf.github.io/postfix.AL2023/RPM-GPG-KEY-yasharf-al2023
+metadata_expire=6h
+# AL2023's own repository is priority=10, and dnf compares priority before
+# version. At the default of 99 this repo would lose and dnf would keep
+# installing 3.7.2.
+priority=5
