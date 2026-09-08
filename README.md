@@ -91,7 +91,7 @@ That jumps across several Postfix releases at once. Read the [release notes](htt
 
 Every Postfix release from 3.11.6 onwards is built, usually within a day of release. 3.11.6 is just where this project started; earlier releases aren't built.
 
-Source tarballs come from a Postfix release mirror and are checked against the Postfix release signing key ([`build/postfix-release-key.asc`](build/postfix-release-key.asc)) before each build. The RPM spec comes from Fedora, which keeps the packaging patches current.
+Source tarballs come from `ftp.porcupine.org`, the Postfix release origin, and are checked against the Postfix release signing key ([`build/postfix-release-key.asc`](build/postfix-release-key.asc)) before each build. The RPM spec comes from Fedora, which keeps the packaging patches current.
 
 The RPMs are signed, and so is the repository metadata, so the generated `.repo` file sets `gpgcheck=1` and `repo_gpgcheck=1`. It also sets `priority=5`, because AL2023's own repository is priority 10 and `dnf` compares priority before version. Without it, `dnf` keeps installing 3.7.2.
 

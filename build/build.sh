@@ -20,13 +20,14 @@ R=${2:?$usage}
 BRANCH=${3:-${POSTFIX_SPEC_BRANCH:-rawhide}}
 DISTGIT=https://src.fedoraproject.org/rpms/postfix/raw/$BRANCH/f
 
-# Mirrors to fetch the tarball from, tried in order. Fedora's lookaside cache
-# is not usable here: it only holds versions Fedora packaged. Most mirrors
-# postfix.org lists are dead or serve an HTML page in place of the file.
-MIRRORS=${POSTFIX_MIRRORS:-"http://ftp.netclusive.de/pub/postfix/postfix-release"}
+# Where to fetch the tarball from. ftp.porcupine.org is the release origin and
+# the only host used; mirrors are copies that lag and widen the supply chain
+# for nothing. Fedora's lookaside cache is not usable here: it only holds
+# versions Fedora packaged.
+MIRRORS=${POSTFIX_MIRRORS:-"ftp://ftp.porcupine.org/mirrors/postfix-release"}
 
-# Postfix release signing key, pinned so an unauthenticated mirror cannot
-# serve a doctored tarball. Where Fedora packaged the same version, its
+# Postfix release signing key, pinned so an unauthenticated download cannot
+# deliver a doctored tarball. Where Fedora packaged the same version, its
 # recorded SHA-512 is checked too.
 KEYFILE=$(dirname "$0")/postfix-release-key.asc
 KEY_FPR=622C7C012254C186677469C50C0B590E80CA15A7
@@ -96,7 +97,7 @@ for m in $MIRRORS; do
     fi
     rm -f "$TOP/SOURCES/$tarball" "$WORK/$tarball.gpg2"
 done
-[ -s "$TOP/SOURCES/$tarball" ] || { echo "no mirror served $tarball"; exit 1; }
+[ -s "$TOP/SOURCES/$tarball" ] || { echo "no source served $tarball"; exit 1; }
 
 gpg --batch --status-fd 3 --verify "$WORK/$tarball.gpg2" "$TOP/SOURCES/$tarball" 3>"$WORK/gpg.status"
 grep -q "^\[GNUPG:\] VALIDSIG $KEY_FPR" "$WORK/gpg.status" || {

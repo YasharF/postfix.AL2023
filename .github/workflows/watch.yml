@@ -1,7 +1,7 @@
 name: Watch
 # Finds Postfix releases not yet published here and hands them to Build.
 #
-# The version list comes from a Postfix release mirror, which carries every
+# The version list comes from the Postfix release origin, which carries every
 # release. The RPM spec comes from Fedora, from the branch matching each
 # release's version series.
 
@@ -49,7 +49,10 @@ jobs:
         if: steps.inflight.outputs.busy == 'false'
         env:
           GH_TOKEN: ${{ github.token }}
-          MIRRORS: ${{ vars.POSTFIX_MIRRORS || 'http://ftp.netclusive.de/pub/postfix/postfix-release' }}
+          # ftp.porcupine.org is the release origin, and the only host used.
+          # Mirrors are copies that lag, so a release can go unseen for days.
+          # Only the FTP tree answers a directory listing; HTTP returns 403.
+          MIRRORS: ${{ vars.POSTFIX_MIRRORS || 'ftp://ftp.porcupine.org/mirrors/postfix-release' }}
         run: |
           set -euo pipefail
 
@@ -73,7 +76,7 @@ jobs:
               | sed -e 's/^postfix-//' -e 's/\.tar\.gz$//' | sort -V -u)
             [ -n "$releases" ] && { echo "release list from $m"; break; }
           done
-          [ -n "$releases" ] || { echo "no mirror served a release listing"; exit 1; }
+          [ -n "$releases" ] || { echo "no source served a release listing"; exit 1; }
 
           wanted=$(for v in $releases; do at_least "$v" && echo "$v"; done)
           echo "at or above $MIN_VERSION:" $wanted
