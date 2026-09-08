@@ -10,9 +10,6 @@
 # The key comes from the environment, never the command line:
 #   RPM_GPG_PRIVATE_KEY  ASCII-armored secret key
 #   RPM_GPG_PASSPHRASE   its passphrase
-#
-# The public half is committed. The secret key must match it, so a swapped or
-# stale secret is caught here instead of at the consumer.
 
 # No -x. It would print the passphrase.
 set -eu -o pipefail
@@ -28,7 +25,7 @@ PUBKEY=$(dirname "$0")/../RPM-GPG-KEY-yasharf-al2023
 : "${RPM_GPG_PASSPHRASE:?the signing key passphrase is not in the environment}"
 [ -s "$PUBKEY" ] || { echo "$PUBKEY is missing; the signing key has not been set up"; exit 1; }
 
-# The image ships gnupg2-minimal, which conflicts with gnupg2 and has no
+# The image ships gnupg2-minimal: it conflicts with gnupg2 and has no
 # gpg-agent for gpg --import.
 dnf -y install --allowerasing gnupg2 findutils
 if [ "$MODE" = rpms ]; then
@@ -42,8 +39,8 @@ umask 077
 export GNUPGHOME=$WORK/gnupg
 mkdir -p "$GNUPGHOME"
 
-# The fingerprint to require comes from the committed public key, so there is
-# one source of truth for which key this repository signs with.
+# The fingerprint to require comes from the committed public key, so a
+# swapped or stale secret is caught here rather than at the consumer.
 gpg --batch --quiet --import "$PUBKEY"
 FPR=$(gpg --batch --list-keys --with-colons | awk -F: '/^fpr/{print $10; exit}')
 [ -n "$FPR" ] || { echo "$PUBKEY holds no key"; exit 1; }
@@ -55,8 +52,7 @@ gpg --batch --list-secret-keys --with-colons | awk -F: '/^fpr/{print $10}' \
     exit 1
 }
 
-# gpg runs unattended here, so the passphrase comes from a file rather than a
-# pinentry prompt.
+# gpg runs unattended, so the passphrase comes from a file, not a prompt.
 PASS=$WORK/passphrase
 printf '%s' "$RPM_GPG_PASSPHRASE" > "$PASS"
 
@@ -65,17 +61,16 @@ rpms)
     mapfile -t files < <(find "$1" -name '*.rpm' | sort)
     [ ${#files[@]} -gt 0 ] || { echo "no RPMs under $1"; exit 1; }
 
-    # The whole command is defined because rpm 4.16's default leaves no hook
-    # for the loopback arguments. Signing only rewrites the header, so the
-    # payload stays the one Verify passed. Architecture does not matter: the
-    # package is never executed, only hashed.
+    # The whole command is defined: rpm's default leaves no hook for the
+    # loopback arguments. Signing rewrites only the header, so the payload
+    # stays the one Verify passed.
     rpmsign \
         --define "_gpg_name $FPR" \
         --define "__gpg_sign_cmd %{__gpg} gpg --batch --no-verbose --no-armor --pinentry-mode loopback --passphrase-file $PASS --no-secmem-warning -u \"%{_gpg_name}\" -sbo %{__signature_filename} --digest-algo sha256 %{__plaintext_filename}" \
         --addsign "${files[@]}"
 
-    # Checked against an rpmdb holding only this key, so this tests the
-    # signature rather than whatever the build host already trusts.
+    # An rpmdb holding only this key, so the check does not lean on whatever
+    # the build host already trusts.
     db=$WORK/rpmdb
     mkdir -p "$db"
     gpg --batch --export --armor "$FPR" > "$WORK/pubkey.asc"

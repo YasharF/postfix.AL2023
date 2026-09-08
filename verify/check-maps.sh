@@ -1,18 +1,16 @@
 #!/bin/bash
 # Check that every map type the build claims to support actually loads.
 #
-# postconf -m lists what dynamicmaps.cf declares, which says nothing about
-# whether the plugin behind it links and dlopens. Asking postmap to query each
-# type against a path that does not exist separates the two: a type whose .so
-# is missing or unloadable fails with "unsupported dictionary type", while one
-# that loads gets far enough to complain about the file or its configuration
-# instead.
+# postconf -m only lists what dynamicmaps.cf declares, not whether the plugin
+# behind it loads. Querying each type against a path that does not exist tells
+# them apart: one that cannot load says "unsupported dictionary type", one that
+# loads complains about the file instead.
 
 set -u
 
-# The map types this spec's subpackages provide, plus the ones built into the
-# core package. sqlite/mysql/pgsql/ldap need a server or a config file to do
-# anything useful, so they are checked for loading only.
+# The types the subpackages provide, plus the ones in the core package.
+# sqlite, mysql, pgsql and ldap need a server, so they are only checked for
+# loading.
 EXPECTED="btree cdb hash ldap lmdb mysql pcre pgsql regexp sqlite texthash static inline"
 
 echo "=== postconf -m ==="
@@ -37,8 +35,8 @@ for t in $EXPECTED; do
     esac
 done
 
-# The map types that can actually be created and read back on a bare host get
-# a real round trip, so this is not only a dlopen check.
+# The types that can be built and read back on a bare host get a real round
+# trip, so this is more than a load check.
 for t in hash btree lmdb cdb; do
     d=$(mktemp -d)
     printf 'alice@example.com\tbob@example.com\n' > "$d/table"

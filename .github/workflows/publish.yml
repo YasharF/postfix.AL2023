@@ -4,9 +4,7 @@ name: Publish
 #
 # One repository per Postfix release series, at al2023/<series>/<arch>/. Each
 # RPM is routed by the version in its filename, so a new series needs no change
-# here.
-#
-# Nothing is ever removed, so older builds stay installable.
+# here. Nothing is ever removed, so older builds stay installable.
 #
 # Publish a build:
 #   gh workflow run Publish -f run_id=<Build run id>
@@ -109,9 +107,9 @@ jobs:
           run-id: ${{ needs.resolve.outputs.run_id }}
           github-token: ${{ github.token }}
 
-      # Signed before anything is copied, so nothing unsigned can reach
-      # gh-pages. A missing key fails the run: publishing unsigned packages
-      # into a gpgcheck=1 repository would produce one nobody can install from.
+      # Signed before anything is copied, so nothing unsigned reaches
+      # gh-pages. A missing key fails the run: unsigned packages published
+      # under gpgcheck=1 leave consumers unable to install.
       - name: Sign the RPMs
         env:
           RPM_GPG_PRIVATE_KEY: ${{ secrets.RPM_GPG_PRIVATE_KEY }}
@@ -122,8 +120,8 @@ jobs:
             echo "RPM_GPG_PRIVATE_KEY is not set; this repository cannot publish unsigned"
             exit 1
           }
-          # -e without a value: the secret comes from the environment rather
-          # than the command line, where it would show up in ps.
+          # -e with no value: the secret comes from the environment, not the
+          # command line, where ps would show it.
           docker run --rm -v "$PWD:/w" -w /w \
             -e RPM_GPG_PRIVATE_KEY -e RPM_GPG_PASSPHRASE \
             public.ecr.aws/amazonlinux/amazonlinux:2023 \
@@ -201,9 +199,9 @@ jobs:
           echo "touched=$touched" >> "$GITHUB_OUTPUT"
           echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
 
-      # createrepo_c from AL2023 itself. --update reuses existing metadata.
-      # Skipped when nothing was added: its output is timestamped, so a no-op
-      # run would still commit churn.
+      # createrepo_c from AL2023 itself; --update reuses existing metadata.
+      # Skipped when nothing was added, because its output is timestamped and
+      # a no-op run would still commit churn.
       - name: Rebuild the repository metadata
         if: steps.add.outputs.new != '0'
         env:
@@ -218,8 +216,8 @@ jobs:
           sudo chown -R "$(id -u):$(id -g)" site
 
       # repomd.xml is what repo_gpgcheck verifies, and createrepo_c has just
-      # rewritten it for each touched tree. Untouched trees keep a metadata
-      # file that their existing signature still covers.
+      # rewritten it for each touched tree. An untouched tree keeps a repomd.xml
+      # its existing signature still covers.
       - name: Sign the repository metadata
         if: steps.add.outputs.new != '0'
         env:
@@ -239,11 +237,11 @@ jobs:
             ./src/build/sign.sh repomd $files
           sudo chown -R "$(id -u):$(id -g)" site
 
-      # site/ is byte for byte what Pages will serve, so install from it here,
-      # over HTTP, exactly as a consumer would. A failure means nothing is
-      # uploaded at all and consumers carry on with the previous release.
+      # site/ is byte for byte what Pages will serve, so install from it over
+      # HTTP exactly as a consumer would. A failure here uploads nothing, and
+      # consumers stay on the previous release.
       #
-      # Only the runner's own architecture can be installed, so this covers
+      # The runner can only install its own architecture, so this covers
       # x86_64; the post-upload check covers both.
       - name: Install from the assembled repository before uploading
         if: steps.add.outputs.new != '0'
@@ -281,7 +279,7 @@ jobs:
           set -euo pipefail
           cd site
           # Where to reset back to if the live repository turns out bad. Empty
-          # when gh-pages did not exist yet, in which case rollback deletes it.
+          # when gh-pages did not exist yet.
           prev=$(git rev-parse HEAD 2>/dev/null || true)
           git add -A
           git -c user.name='github-actions[bot]' \
@@ -305,11 +303,10 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      # Pages takes a while to deploy. Without this the check reads stale
-      # metadata, or a 404 that fixes itself a minute later.
-      # Waiting for repomd.xml to merely exist is not enough: the old one is
-      # still there and still valid, and a check that runs against it passes
-      # without ever seeing the release it was meant to test.
+      # Pages takes a while to deploy, so the check would otherwise read a 404
+      # or stale metadata. Waiting for repomd.xml to exist is not enough: the
+      # old one is still there and still valid, and a check against it passes
+      # without ever seeing the new release.
       - name: Wait for Pages to serve the new release
         env:
           BASE: https://yasharf.github.io/postfix.AL2023/al2023/${{ matrix.job.series }}/${{ matrix.job.arch }}
@@ -319,9 +316,9 @@ jobs:
           for _ in $(seq 1 60); do
             if curl -fsS -o /tmp/repomd.xml "$BASE/repodata/repomd.xml"; then
               href=$(sed -n 's|.*href="\(repodata/[^"]*primary\.xml\.gz\)".*|\1|p' /tmp/repomd.xml | head -1)
-              # Unpacked to a file rather than piped into grep: grep -q exits
-              # on the first match, which leaves gzip writing into a closed
-              # pipe, and pipefail then reports the match as a failure.
+              # Unpacked to a file, not piped into grep: grep -q exits on the
+              # first match, gzip is left writing into a closed pipe, and
+              # pipefail then reports the match as a failure.
               if [ -n "$href" ] &&
                  curl -fsS -o /tmp/primary.xml.gz "$BASE/$href" &&
                  gzip -dcf /tmp/primary.xml.gz > /tmp/primary.xml &&
@@ -335,8 +332,8 @@ jobs:
           echo "the site never served $VERSION for series ${{ matrix.job.series }} on ${{ matrix.job.arch }}"
           exit 1
 
-      # Retried, because a failure here rolls the release back. A slow deploy
-      # or a momentary error must not be mistaken for a broken package.
+      # Retried, because a failure here rolls the release back: a slow deploy
+      # must not be mistaken for a broken package.
       - name: A consumer can install Postfix from it
         env:
           SERIES: ${{ matrix.job.series }}
@@ -358,8 +355,8 @@ jobs:
           exit 1
 
   # Withdraw the release if the live repository is bad. Reset rather than
-  # revert: a release that fails this way every day would otherwise add its
-  # packages to the branch history on every retry.
+  # revert, so a release that fails this way daily does not add its packages to
+  # the branch history on every retry.
   rollback:
     needs: [publish, smoke]
     if: always() && needs.publish.outputs.published == 'true' && needs.smoke.result == 'failure'
@@ -373,9 +370,8 @@ jobs:
           PREV: ${{ needs.publish.outputs.prev_sha }}
         run: |
           set -euo pipefail
-          # No recorded rollback point means the publish job did not find an
-          # existing gh-pages. Something is wrong that a rollback cannot fix,
-          # so stop and leave the branch alone.
+          # No rollback point means the publish job found no existing
+          # gh-pages. A rollback cannot fix that, so leave the branch alone.
           if [ -z "$PREV" ]; then
             echo "no rollback point was recorded for this publish"
             echo "refusing to touch gh-pages; look at it by hand"
@@ -391,7 +387,7 @@ jobs:
           echo "resetting gh-pages from $(git rev-parse HEAD) back to $PREV"
           git reset -q --hard "$PREV"
           # A force push is irreversible, so refuse one that would leave the
-          # repository with nothing in it.
+          # repository empty.
           n=$(find al2023 -name '*.rpm' 2>/dev/null | wc -l)
           [ "$n" -gt 0 ] || {
             echo "the rollback target holds no packages; refusing to push"

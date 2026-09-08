@@ -28,7 +28,7 @@ permissions:
 
 jobs:
   # A manual run names one release. A run from Watch carries only its run id,
-  # so the list comes from Watch's artifact. No artifact means nothing to do.
+  # so the list comes from Watch's artifact; no artifact means nothing to do.
   resolve:
     if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-24.04

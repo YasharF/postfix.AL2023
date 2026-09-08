@@ -3,10 +3,9 @@
 #
 #   wait-for-delivery.sh /root/Maildir plain-smtp
 #
-# Postfix accepting a message and Postfix delivering it are different events,
-# so the SMTP check alone proves nothing about local delivery. This polls
-# rather than sleeping a fixed amount: delivery is usually immediate, but the
-# queue manager can take a moment on a loaded runner.
+# Accepting a message and delivering it are different events, so the SMTP
+# check alone says nothing about local delivery. Polls rather than sleeping a
+# fixed amount: the queue manager can take a moment on a loaded runner.
 
 set -u
 

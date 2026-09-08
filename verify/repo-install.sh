@@ -5,12 +5,11 @@
 #   verify/repo-install.sh <series> [expected-version-release]
 #
 # Give the expected version when checking a repository that has just been
-# published. Without it this only checks the repository is self consistent,
-# which stale metadata satisfies just as well as fresh metadata.
+# published. Without it, stale metadata passes as readily as fresh metadata.
 #
-# Expects /etc/yum.repos.d/postfix-al2023-<series>.repo to already be in place,
-# so the caller decides whether it points at a local copy of the repository or
-# at the published site. Run on AL2023 as root.
+# The caller puts /etc/yum.repos.d/postfix-al2023-<series>.repo in place, so it
+# decides whether that points at a local copy or at the published site. Run on
+# AL2023 as root.
 
 set -eux -o pipefail
 
@@ -29,8 +28,8 @@ chmod 700 "$GNUPGHOME"
 dnf -q repolist
 dnf list --showduplicates postfix
 
-# The newest postfix this repository offers. Anything else means dnf preferred
-# AL2023's own package, which is what priority= exists to prevent.
+# The newest postfix this repository offers. Installing anything else means
+# dnf preferred AL2023's own package, which priority= exists to prevent.
 want=$(dnf -q repoquery --repo="$ID" --qf '%{version}-%{release}' postfix | sort -V | tail -1)
 [ -n "$want" ] || { echo "the repository offers no postfix at all"; exit 1; }
 
@@ -61,8 +60,8 @@ keyid=$(gpg --show-keys --with-colons /tmp/key.asc | awk -F: '/^fpr/{print $10; 
 [ -n "$keyid" ] || { echo "$keyurl holds no key"; exit 1; }
 echo "expecting signatures from key $keyid"
 
-# The signature is in the RSAHEADER tag, not SIGPGP, so read the rendered
-# line rather than naming a tag that a header-only signature leaves empty.
+# A header-only signature leaves SIGPGP empty, so read the rendered Signature
+# line rather than naming a tag.
 for p in postfix postfix-pcre postfix-lmdb; do
     sig=$(rpm -qi "$p" | sed -n 's/^Signature *: *//p')
     case "$sig" in
@@ -72,7 +71,7 @@ for p in postfix postfix-pcre postfix-lmdb; do
 done
 
 # Against an rpmdb holding no keys first. If that verified, the check below
-# would prove nothing: it would pass for an unsigned package too.
+# would prove nothing: an unsigned package would pass it too.
 url=$(dnf -q repoquery --repo="$ID" --location "postfix-$got" | tail -1)
 curl -fsSLo /tmp/pkg.rpm "$url"
 mkdir -p /tmp/db
@@ -85,13 +84,13 @@ rpm --dbpath /tmp/db --import /tmp/key.asc
 rpm --dbpath /tmp/db -K /tmp/pkg.rpm | grep -q "digests signatures OK"
 
 # The metadata signature, against the key the repository publishes rather than
-# the copy dnf has already imported.
+# the copy dnf already imported.
 gpg --batch --quiet --import /tmp/key.asc
 curl -fsSLo /tmp/repomd.xml "$baseurl/repodata/repomd.xml"
 curl -fsSLo /tmp/repomd.xml.asc "$baseurl/repodata/repomd.xml.asc"
 gpg --batch --verify /tmp/repomd.xml.asc /tmp/repomd.xml
 
-# sendmail symlinks come from %post, not from the package, so a broken
+# The sendmail symlinks come from %post, not from the package, so a broken
 # scriptlet shows up only here.
 command -v sendmail mailq newaliases rmail
 

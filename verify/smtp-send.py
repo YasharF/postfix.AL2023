@@ -4,9 +4,7 @@
     smtp-send.py --to root@example.com [--starttls]
 
 Exits non-zero if the connection, the handshake, or the message is refused.
-The point is to exercise the running smtpd -- STARTTLS included -- rather than
-to test any particular content, so the body just carries the marker the
-delivery check greps for.
+The body just carries the marker the delivery check greps for.
 """
 import argparse
 import smtplib
@@ -35,9 +33,8 @@ with smtplib.SMTP(a.host, a.port, timeout=30) as s:
         if not s.has_extn("starttls"):
             print("smtpd did not advertise STARTTLS", file=sys.stderr)
             sys.exit(1)
-        # The cert postfix's %post generates is self-signed, so verification
-        # is off here on purpose -- this is checking that the TLS build works
-        # and the handshake completes, not that a CA trusts the cert.
+        # The cert %post generates is self-signed. This checks that the
+        # handshake completes, not that a CA trusts the cert.
         ctx = ssl.create_default_context()
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE

@@ -1,9 +1,8 @@
 name: Watch
 # Finds Postfix releases not yet published here and hands them to Build.
 #
-# The version list comes from the Postfix release origin, which carries every
-# release. The RPM spec comes from Fedora, from the branch matching each
-# release's version series.
+# The version list comes from the Postfix release origin. The spec comes from
+# the Fedora branch matching each release's version series.
 
 on:
   schedule:
@@ -26,8 +25,7 @@ jobs:
       candidates: ${{ steps.scan.outputs.candidates }}
       found: ${{ steps.scan.outputs.found }}
     steps:
-      # A manual run during a build would start a second build of the same
-      # release.
+      # A manual run during a build would build the same release twice.
       - name: Skip if a Build is already running
         id: inflight
         env:
@@ -49,9 +47,8 @@ jobs:
         if: steps.inflight.outputs.busy == 'false'
         env:
           GH_TOKEN: ${{ github.token }}
-          # ftp.porcupine.org is the release origin, and the only host used.
-          # Mirrors are copies that lag, so a release can go unseen for days.
-          # Only the FTP tree answers a directory listing; HTTP returns 403.
+          # ftp.porcupine.org is the release origin; mirrors lag. Only the
+          # FTP tree answers a directory listing, HTTP returns 403.
           MIRRORS: ${{ vars.POSTFIX_MIRRORS || 'ftp://ftp.porcupine.org/mirrors/postfix-release' }}
         run: |
           set -euo pipefail
@@ -108,7 +105,7 @@ jobs:
               echo "SKIP $v: no Fedora branch carries $s"
               continue
             fi
-            # Fedora's release number if it packaged this exact version, else 1.
+            # Fedora's release number where it packaged this exact version.
             sv=${spec_version[$s]}
             if [ "${sv%-*}" = "$v" ]; then r=${sv##*-}; else r=1; fi
 
@@ -140,7 +137,7 @@ jobs:
             echo "found=$([ "$n" -gt 0 ] && echo true || echo false)"
           } >> "$GITHUB_OUTPUT"
 
-      # Build triggers on this workflow completing. A GITHUB_TOKEN run cannot
+      # Build triggers on this workflow completing: a GITHUB_TOKEN run cannot
       # dispatch another workflow directly.
       - name: Leave a marker for Build
         if: steps.scan.outputs.found == 'true'

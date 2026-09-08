@@ -116,8 +116,8 @@ jobs:
           echo "postfix never listened on 127.0.0.1:25"
           exit 1
 
-      # No hardcoded version. The binary must match its own package, which
-      # holds for any release and catches a build using the wrong tarball.
+      # No version is hardcoded: the binary must match its own package. That
+      # holds for any release, and catches a build from the wrong tarball.
       - name: The running binary is the version its package claims
         run: |
           pkg=$(docker exec postfix rpm -q --qf '%{version}' postfix)
@@ -156,8 +156,8 @@ jobs:
           [ "$(docker exec postfix sh -c 'postqueue -p | grep -c "^[A-F0-9]"')" = 0 ] \
             || { echo "messages left in the queue"; exit 1; }
 
-      # The upgrade path a real host takes. Separate container so the checks
-      # above run against a clean install.
+      # The upgrade path a real host takes. A separate container, so the
+      # checks above run against a clean install.
       - name: An AL2023 host upgrades in place
         run: |
           docker run --rm -v "$PWD:/w" -w /w \

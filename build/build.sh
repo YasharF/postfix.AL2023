@@ -11,24 +11,16 @@ usage='usage: build.sh <postfix-version> <fedora-spec-release> [fedora-branch]'
 V=${1:?$usage}
 R=${2:?$usage}
 
-# Fedora branch to take the spec from. Its patches are rebased per version
-# series, so the branch must carry the same series as $V. There is no epel9
-# branch and EPEL 9 has no postfix package, so Fedora is the only source.
-#
-# Fedora does not package every release, so its spec version is often not the
-# one being built. The Version field is rewritten below.
+# Fedora branch to take the spec from. Its patches are per version series, so
+# the branch must carry the same series as $V.
 BRANCH=${3:-${POSTFIX_SPEC_BRANCH:-rawhide}}
 DISTGIT=https://src.fedoraproject.org/rpms/postfix/raw/$BRANCH/f
 
-# Where to fetch the tarball from. ftp.porcupine.org is the release origin and
-# the only host used; mirrors are copies that lag and widen the supply chain
-# for nothing. Fedora's lookaside cache is not usable here: it only holds
-# versions Fedora packaged.
+# Where to fetch the tarball from. ftp.porcupine.org is the release origin.
+# Mirrors are copies that lag.
 MIRRORS=${POSTFIX_MIRRORS:-"ftp://ftp.porcupine.org/mirrors/postfix-release"}
 
-# Postfix release signing key, pinned so an unauthenticated download cannot
-# deliver a doctored tarball. Where Fedora packaged the same version, its
-# recorded SHA-512 is checked too.
+# Postfix release signing key, pinned so a tampered tarball is rejected.
 KEYFILE=$(dirname "$0")/postfix-release-key.asc
 KEY_FPR=622C7C012254C186677469C50C0B590E80CA15A7
 
@@ -43,7 +35,7 @@ get() { curl -fsSL --retry 5 --retry-delay 5 --retry-all-errors "$@"; }
 dnf -y install rpm-build 'dnf-command(builddep)' \
     findutils tar gzip gcc make patch sed m4 util-linux diffutils chkconfig
 
-# The image ships gnupg2-minimal, which conflicts with gnupg2 and has no
+# The image ships gnupg2-minimal: it conflicts with gnupg2 and has no
 # gpg-agent for gpg --import.
 dnf -y install --allowerasing gnupg2
 
@@ -75,7 +67,6 @@ if [ "$specver" != "$V" ]; then
 fi
 sed -i "s/^Release:[[:space:]]*[0-9]\{1,\}/Release:        $R/" "$SPEC"
 
-# Fetch and verify the tarball before using it.
 export GNUPGHOME=$WORK/gnupg
 mkdir -p "$GNUPGHOME"; chmod 700 "$GNUPGHOME"
 gpg --batch --quiet --import "$KEYFILE"
@@ -126,8 +117,8 @@ while read -r alg name _ hash; do
     echo "$hash  $TOP/SOURCES/$name" | sha512sum -c -
 done < "$WORK/sources"
 
-# Patches, unit files and config snippets live in dist-git beside the spec.
-# Read from the spec, so a newly added source is picked up.
+# Patches, unit files and config snippets sit in dist-git beside the spec.
+# The names come from the spec, so a newly added source is picked up.
 pflogsumm_ver=$(sed -n 's/^%define pflogsumm_ver[[:space:]]*//p' "$SPEC" | head -1)
 while read -r ref; do
     f=${ref##*/}
@@ -143,13 +134,10 @@ while read -r ref; do
     fi
 done < <(sed -nE 's/^(Source|Patch)[0-9]*:[[:space:]]*(.*[^[:space:]])[[:space:]]*$/\2/p' "$SPEC")
 
-# AL2023's alternatives (chkconfig 1.15) knows --slave, not the newer
-# --follower that Fedora's %post uses. Left alone it exits with a usage error,
-# and since rpm only warns on a failed %post, the package installs without
+# AL2023's alternatives knows --slave, not the --follower Fedora's %post uses.
+# --slave is the older name for the same option. Left alone the scriptlet exits
+# with a usage error, and rpm only warns, so the package installs without
 # sendmail, mailq, newaliases or rmail.
-#
-# --slave is the older name for the same option. Conditional, so it stops
-# applying if AL2023 ships a newer chkconfig.
 if alternatives --help 2>&1 | grep -q -- --follower; then
     echo "this alternatives understands --follower; leaving the scriptlets alone"
 else
@@ -159,9 +147,8 @@ fi
 
 chown -R builder "$WORK"
 
-# Build as RHEL 9, which AL2023 is closest to. The spec then drops the
-# libnsl2-devel BuildRequires (no such package on AL2023), builds with -DNO_NIS
-# and without -lnsl, and applies the version-mismatch-warning patch.
+# Build as RHEL 9, which AL2023 is closest to. That path drops the
+# libnsl2-devel BuildRequires, which AL2023 has no package for.
 RHEL=(--define "rhel 9")
 
 dnf -y builddep "$SPEC" "${RHEL[@]}"

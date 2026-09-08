@@ -9,8 +9,7 @@ inet_protocols = ipv4
 mydestination = $myhostname, localhost.$mydomain, localhost, $mydomain
 mynetworks = 127.0.0.0/8
 
-# Deliver locally to a Maildir under /var/mail so a delivered message is a
-# file the checks can look for, rather than something to parse out of mbox.
+# Maildir, so a delivered message is a file the checks can look for.
 home_mailbox = Maildir/
 
 # STARTTLS, using the self-signed cert the postfix %post scriptlet generates.
